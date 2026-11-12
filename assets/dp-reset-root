@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# dp-reset-root —— 由 dp-reset-gui 通过 pkexec（或 sudo -n）调用的 root 侧助手。
+#
+# 只做一件事：对给定的 amdgpu DP 链路各做一次「软件拔插」= trigger_hotplug 0 → 1，
+# 也就是让这条链路重新训练 + 接收端重新锁定（解决整屏错位 / 拼接线 / 光标一起错）。
+#
+# 设计要点：
+#   · 一次调用可传多个接口 → 只需要用户授权一次密码
+#   · 目标用「cardN-DP-N」标识；GPU 的 PCI 地址、debugfs 路径全部现场解析，
+#     不写死任何机器的地址/接口号
+#   · 先全量校验、后逐个执行（不会做到一半才发现参数非法）
+#   · 只接受 amdgpu 上、status=connected 的 DP-N；拒绝 eDP/HDMI/其它接口
+#   · 只写 debugfs 的 trigger_hotplug，不改任何配置文件、不动 monitors.xml
+#   · 除 sleep 外只用 bash 内建（$EUID / read / printf 重定向 / cd -P + pwd -P），
+#     在 NixOS 之类没有 /usr/bin/coreutils 的发行版上也能跑
+#
+# 用法（GUI 会自动这么调）：
+#   pkexec dp-reset-root [--dry-run] [--lang=zh_CN] [--keep-off=2] card0-DP-4 card0-DP-9
+#
+# 环境变量：
+#   DP_RESET_KEEP_OFF     断开后保持多少秒再点亮（默认 2）
+#   DP_RESET_LANG         输出语言 zh/en（GUI 用 --lang 传，pkexec 会清理环境）
+#   DP_RESET_DEBUGFS_ROOT debugfs 根目录（默认 /sys/kernel/debug，仅测试用）
+#   DP_RESET_SYSFS_ROOT   sysfs 根目录（默认 /sys，仅测试用）
+#
+# 退出码：0 全部完成；2 参数/前置条件不满足；3 非 root；4 debugfs 不可用；5 写入失败
+
+set -u
+
+# pkexec 会重置 PATH，这里补全常见路径（含 NixOS 的 profile 路径）。
+PATH="${PATH:-/usr/bin:/bin}:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin"
+SYSFS_ROOT="${DP_RESET_SYSFS_ROOT:-/sys}"
+SYS_DRM="$SYSFS_ROOT/class/drm"
+DBG_ROOT="${DP_RESET_DEBUGFS_ROOT:-/sys/kernel/debug}"
+KEEP_OFF="${DP_RESET_KEEP_OFF:-2}"
+LANG_SEL="${DP_RESET_LANG:-${LANG:-}}"
+DRY_RUN=0
+
+case "$LANG_SEL" in
+    zh*) ZH=1 ;;
+    *) ZH=0 ;;
+esac
+
+# t <英文> <中文>：按语言输出一行。
+t() {
+    if [ "$ZH" = 1 ]; then
+        printf '%s\n' "$2"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+usage() {
+    t "usage: dp-reset-root [--dry-run] [--lang=zh_CN] [--keep-off=2] cardN-DP-N [cardN-DP-N ...]" \
+      "用法：dp-reset-root [--dry-run] [--lang=zh_CN] [--keep-off=2] cardN-DP-N [cardN-DP-N ...]"
+}
+
+args=()
+for a in "$@"; do
+    case "$a" in
+        --dry-run) DRY_RUN=1 ;;
+        --keep-off=*) KEEP_OFF="${a#--keep-off=}" ;;
+        --lang=*) LANG_SEL="${a#--lang=}"; case "$LANG_SEL" in zh*) ZH=1 ;; *) ZH=0 ;; esac ;;
+        -h|--help) usage; exit 0 ;;
+        -*) printf 'unknown option: %s\n' "$a" >&2; usage >&2; exit 2 ;;
+        *) args+=("$a") ;;
+    esac
+done
+
+if [ "${#args[@]}" -eq 0 ]; then
+    usage >&2
+    exit 2
+fi
+
+# 真实运行时必须是 root；只有显式指定了假的 sysfs 根（测试用）才放行非 root，
+# 这样单元测试可以在普通用户下跑完整校验/干跑逻辑，且没有任何提权副作用。
+if [ "$EUID" -ne 0 ] && [ -z "${DP_RESET_SYSFS_ROOT:-}" ]; then
+    t "requires root (run through pkexec or sudo)" "需要 root 权限（请通过 pkexec 或 sudo 调用）" >&2
+    exit 3
+fi
+
+case "$KEEP_OFF" in
+    ''|*[!0-9]*)
+        t "DP_RESET_KEEP_OFF must be a number of seconds" "DP_RESET_KEEP_OFF 必须是秒数" >&2
+        exit 2
+        ;;
+esac
+
+SLEEP="$(command -v sleep || true)"
+if [ -z "$SLEEP" ]; then
+    t "sleep not found in PATH" "PATH 里找不到 sleep" >&2
+    exit 4
+fi
+
+# debugfs 是否被挂成只读（只对默认位置判断；测试用的假根目录不判断）。
+debugfs_is_ro() {
+    [ "$DBG_ROOT" = "/sys/kernel/debug" ] || return 1
+    local opts
+    opts="$(awk '$2 == "/sys/kernel/debug" { print $4 }' /proc/mounts 2>/dev/null)"
+    case ",$opts," in
+        *,ro,*) return 0 ;;
+    esac
+    return 1
+}
+
+# ---- 第一遍：全量校验，任何一条不合法就整体拒绝 ----
+declare -a conns=() files=()
+for id in "${args[@]}"; do
+    if [[ ! "$id" =~ ^card[0-9]+-DP-[0-9]+$ ]]; then
+        t "reject '$id': expected cardN-DP-N (e.g. card0-DP-4)" \
+          "拒绝 '$id'：参数应为 cardN-DP-N（如 card0-DP-4）" >&2
+        exit 2
+    fi
+    card="${id%%-*}"
+    conn="${id#*-}"
+    carddir="$SYS_DRM/$card"
+    conndir="$SYS_DRM/$id"
+
+    if [ ! -d "$carddir" ] || [ ! -d "$conndir" ]; then
+        t "reject '$id': connector not present in $SYS_DRM" \
+          "拒绝 '$id'：$SYS_DRM 里不存在该接口" >&2
+        exit 2
+    fi
+
+    # 解析 GPU 的驱动名：必须是 amdgpu（i915/nouveau 等没有这个 debugfs 接口）。
+    drvdir="$(cd -P "$carddir/device/driver" 2>/dev/null && pwd -P)" || drvdir=""
+    if [ -z "$drvdir" ] || [ "${drvdir##*/}" != "amdgpu" ]; then
+        t "reject '$id': not an amdgpu output (driver='${drvdir##*/}')" \
+          "拒绝 '$id'：不是 amdgpu 输出（driver='${drvdir##*/}'）" >&2
+        exit 2
+    fi
+
+    # 解析 PCI 地址（debugfs 的目录名），不写死任何 BDF。
+    devdir="$(cd -P "$carddir/device" 2>/dev/null && pwd -P)" || devdir=""
+    bdf="${devdir##*/}"
+    if [ -z "$bdf" ]; then
+        t "reject '$id': cannot resolve PCI address of $card" \
+          "拒绝 '$id'：无法解析 $card 的 PCI 地址" >&2
+        exit 2
+    fi
+
+    status=""
+    IFS= read -r status < "$conndir/status" 2>/dev/null || true
+    if [ "$status" != "connected" ]; then
+        t "reject '$id': status='$status' (not connected)" \
+          "拒绝 '$id'：status='$status'（不是 connected）" >&2
+        exit 2
+    fi
+
+    trigger="$DBG_ROOT/dri/$bdf/$conn/trigger_hotplug"
+    if [ ! -e "$trigger" ]; then
+        t "debugfs entry not found: $trigger" "找不到 debugfs 文件：$trigger" >&2
+        if debugfs_is_ro; then
+            t "hint: /sys/kernel/debug is mounted read-only; try: mount -o remount,rw /sys/kernel/debug" \
+              "提示：/sys/kernel/debug 当前是只读挂载；可尝试：mount -o remount,rw /sys/kernel/debug" >&2
+        else
+            t "hint: is debugfs mounted on $DBG_ROOT? (mount -t debugfs none $DBG_ROOT)" \
+              "提示：debugfs 是否挂载在 $DBG_ROOT？（mount -t debugfs none $DBG_ROOT）" >&2
+        fi
+        exit 4
+    fi
+    if [ ! -w "$trigger" ]; then
+        t "cannot write $trigger" "无法写入 $trigger" >&2
+        if debugfs_is_ro; then
+            t "hint: /sys/kernel/debug is mounted read-only; try: mount -o remount,rw /sys/kernel/debug" \
+              "提示：/sys/kernel/debug 当前是只读挂载；可尝试：mount -o remount,rw /sys/kernel/debug" >&2
+        fi
+        exit 4
+    fi
+
+    conns+=("$id")
+    files+=("$trigger")
+done
+
+if [ "$DRY_RUN" = 1 ]; then
+    t "dry run: would reset ${conns[*]} (off for ${KEEP_OFF}s)" \
+      "干跑：将重抽 ${conns[*]}（断开保持 ${KEEP_OFF}s）"
+    exit 0
+fi
+
+# ---- 第二遍：逐个执行 0 → 等待 → 1 ----
+t "will reset: ${conns[*]}  (off for ${KEEP_OFF}s)" \
+  "将重抽：${conns[*]}  （断开保持 ${KEEP_OFF}s）"
+
+for i in "${!conns[@]}"; do
+    id="${conns[$i]}"
+    trigger="${files[$i]}"
+
+    t "--- $id: link down (trigger_hotplug=0)" "--- $id：断开链路（trigger_hotplug=0）"
+    if ! printf '0\n' > "$trigger" 2>/dev/null; then
+        t "failed to write 0 to $trigger" "写入 $trigger = 0 失败" >&2
+        exit 5
+    fi
+    "$SLEEP" 1
+
+    t "--- $id: hold ${KEEP_OFF}s" "--- $id：保持断开 ${KEEP_OFF}s"
+    "$SLEEP" "$KEEP_OFF"
+
+    t "--- $id: retrain and bring up (trigger_hotplug=1)" "--- $id：重新探测并点亮（trigger_hotplug=1）"
+    if ! printf '1\n' > "$trigger" 2>/dev/null; then
+        t "failed to write 1 to $trigger" "写入 $trigger = 1 失败" >&2
+        exit 5
+    fi
+    "$SLEEP" 2
+
+    status=""
+    IFS= read -r status < "$SYS_DRM/$id/status" 2>/dev/null || true
+    t "--- $id: done (status=${status:-?})" "--- $id：完成（status=${status:-?}）"
+done
+
+t "OK: ${#conns[@]} link(s) retrained" "OK：${#conns[@]} 条链路已重抽"

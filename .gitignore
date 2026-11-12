@@ -1,0 +1,25 @@
+# 构建产物（构建一律输出到 dist/）
+/dist/
+
+# 直接在源码目录 `go build` 时产出的默认二进制
+/dp-reset-gui
+
+# 仓库内的 Go 构建缓存（沙箱 / 离线构建时使用）
+/.gocache/
+
+# 渲染与自检生成的图片（docs/ 下的示例图要提交）
+*.png
+!docs/*.png
+
+# 备份文件
+*.bak-*
+
+# Python 缓存（assets/ 下有辅助脚本）
+__pycache__/
+
+# 编辑器目录
+.idea/
+.vscode/
+
+# 日志
+*.log
